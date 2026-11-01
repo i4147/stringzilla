@@ -1,0 +1,407 @@
+/**
+ *  @brief RISC-V Vector (RVV 1.0) backend for hash.
+ *  @file include/stringzilla/hash/rvv.h
+ *  @author Ash Vardanian
+ *  @sa include/stringzilla/hash.h
+ */
+#ifndef STRINGZILLA_HASH_RVV_H_
+#define STRINGZILLA_HASH_RVV_H_
+#include "stringzilla/types.h"
+#include "stringzilla/hash/serial.h"
+#include "stringzilla/compare.h" 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#if SZ_USE_RVV
+#include <riscv_vector.h>
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("arch=+v"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("arch=+v")
+#endif
+SZ_API_COMPTIME sz_u64_t sz_bytesum_rvv(sz_cptr_t text, sz_size_t length) {
+    sz_u8_t const *text_u8 = (sz_u8_t const *)text;
+    sz_u64_t bytesum = 0;
+    while (length) {
+        sz_size_t want = length < 256 ? length : 256;
+        sz_size_t vector_length = __riscv_vsetvl_e8m8(want);
+        vuint8m8_t text_u8m8 = __riscv_vle8_v_u8m8(text_u8, vector_length);
+        vuint16m1_t zero_u16m1 = __riscv_vmv_v_x_u16m1(0, __riscv_vsetvl_e16m1(1));
+        vuint16m1_t partial_u16m1 = __riscv_vwredsumu_vs_u8m8_u16m1(text_u8m8, zero_u16m1, vector_length);
+        bytesum += (sz_u64_t)__riscv_vmv_x_s_u16m1_u16(partial_u16m1);
+        text_u8 += vector_length, length -= vector_length;
+    }
+    return bytesum;
+}
+#pragma region RVV AES Round (vector permute tower field)
+SZ_HELPER_INLINE sz_u8_t const *sz_aes_tables_rvv_(void) {
+    static sz_align_(16) sz_u8_t const tables[16 * 10] = {
+         0, 1,   16,  17,  38,  39,  54,  55,  44,  45,  60,  61,  10,  11,  26,  27,
+         0, 140, 245, 121, 132, 8,   113, 253, 117, 249, 128, 12,  241, 125, 4,   136,
+         0, 31,  178, 173, 171, 180, 25,  6,   54,  41,  132, 155, 157, 130, 47,  48,
+         0, 62,  101, 91,  96,  94,  5,   59,  108, 82,  9,   55,  12,  50,  105, 87,
+         0, 1,   4,   5,   3,   2,   7,   6,   12,  13,  8,   9,   15,  14,  11,  10,
+         0, 1,   9,   14,  13,  11,  7,   6,   15,  2,   12,  5,   10,  4,   3,   8,
+         0, 0,   1,   4,   2,   8,   5,   10,  3,   14,  9,   7,   6,   13,  11,  12,
+         1, 2,   4,   8,   3,   6,   12,  11,  5,   10,  7,   14,  15,  13,  9,   1,
+         0, 2,   4,   6,   8,   10,  12,  14,  3,   1,   7,   5,   11,  9,   15,  13,
+         0, 6,   12,  10,  11,  13,  7,   1,   5,   3,   9,   15,  14,  8,   2,   4};
+    return &tables[0];
+}
+SZ_HELPER_INLINE sz_u8_t const *sz_aes_shiftrows_rvv_(void) {
+    static sz_align_(16) sz_u8_t const order[16] = {0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11};
+    return &order[0];
+}
+SZ_HELPER_INLINE sz_u8_t const *sz_aes_rot1_rvv_(void) {
+    static sz_align_(16) sz_u8_t const rot1[16] = {1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12};
+    return &rot1[0];
+}
+SZ_HELPER_AUTO vuint8m1_t sz_gf16_mul_rvv_(vuint8m1_t a_u8m1, vuint8m1_t b_u8m1, vuint8m1_t log_table_u8m1,
+                                           vuint8m1_t antilog_table_u8m1, sz_size_t vector_length) {
+    vuint8m1_t log_a_u8m1 = __riscv_vrgather_vv_u8m1(log_table_u8m1, a_u8m1, vector_length);
+    vuint8m1_t log_b_u8m1 = __riscv_vrgather_vv_u8m1(log_table_u8m1, b_u8m1, vector_length);
+    vuint8m1_t log_sum_u8m1 = __riscv_vadd_vv_u8m1(log_a_u8m1, log_b_u8m1, vector_length);
+    vbool8_t overflow_b8 = __riscv_vmsgeu_vx_u8m1_b8(log_sum_u8m1, 15, vector_length);
+    log_sum_u8m1 = __riscv_vmerge_vvm_u8m1(log_sum_u8m1, __riscv_vsub_vx_u8m1(log_sum_u8m1, 15, vector_length),
+                                           overflow_b8, vector_length);
+    vuint8m1_t product_u8m1 = __riscv_vrgather_vv_u8m1(antilog_table_u8m1, log_sum_u8m1, vector_length);
+    vbool8_t zero_b8 = __riscv_vmor_mm_b8(__riscv_vmseq_vx_u8m1_b8(a_u8m1, 0, vector_length),
+                                          __riscv_vmseq_vx_u8m1_b8(b_u8m1, 0, vector_length), vector_length);
+    return __riscv_vmerge_vvm_u8m1(product_u8m1, __riscv_vmv_v_x_u8m1(0, vector_length), zero_b8, vector_length);
+}
+/**
+ *  @brief Bit-exact RVV emulation of a single `_mm_aesenc_si128` round.
+ *  @return Result of `MixColumns(SubBytes(ShiftRows(state))) ^ round_key`, identical to
+ *          `sz_emulate_aesenc_si128_serial_`.
+ *  @see Mike Hamburg, "Accelerating AES with Vector Permute Instructions" (CHES 2009).
+ */
+SZ_HELPER_AUTO sz_u128_vec_t sz_emulate_aesenc_rvv_(sz_u128_vec_t state_vec, sz_u128_vec_t round_key_vec) {
+    sz_size_t vector_length = __riscv_vsetvl_e8m1(sizeof(sz_u128_vec_t)); 
+    sz_u8_t const *tables = sz_aes_tables_rvv_();
+    vuint8m1_t state_bytes_u8m1 = __riscv_vle8_v_u8m1(state_vec.u8s, vector_length);
+    vuint8m1_t key_u8m1 = __riscv_vle8_v_u8m1(round_key_vec.u8s, vector_length);
+    vuint8m1_t mlow_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 0, vector_length);
+    vuint8m1_t mhigh_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 1, vector_length);
+    vuint8m1_t glow_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 2, vector_length);
+    vuint8m1_t ghigh_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 3, vector_length);
+    vuint8m1_t square_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 4, vector_length);
+    vuint8m1_t inverse4_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 5, vector_length);
+    vuint8m1_t log_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 6, vector_length);
+    vuint8m1_t antilog_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 7, vector_length);
+    vuint8m1_t mul_a_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 8, vector_length);
+    vuint8m1_t mul_b_u8m1 = __riscv_vle8_v_u8m1(tables + 16 * 9, vector_length);
+    vuint8m1_t low_nibble_u8m1 = __riscv_vand_vx_u8m1(state_bytes_u8m1, 0x0f, vector_length);
+    vuint8m1_t high_nibble_u8m1 = __riscv_vsrl_vx_u8m1(state_bytes_u8m1, 4, vector_length);
+    vuint8m1_t tower_u8m1 = __riscv_vxor_vv_u8m1(__riscv_vrgather_vv_u8m1(mlow_u8m1, low_nibble_u8m1, vector_length),
+                                                 __riscv_vrgather_vv_u8m1(mhigh_u8m1, high_nibble_u8m1, vector_length),
+                                                 vector_length);
+    vuint8m1_t tower_high_u8m1 = __riscv_vsrl_vx_u8m1(tower_u8m1, 4, vector_length);
+    vuint8m1_t tower_low_u8m1 = __riscv_vand_vx_u8m1(tower_u8m1, 0x0f, vector_length);
+    vuint8m1_t low_squared_u8m1 = __riscv_vrgather_vv_u8m1(square_u8m1, tower_low_u8m1, vector_length);
+    vuint8m1_t high_squared_u8m1 = __riscv_vrgather_vv_u8m1(square_u8m1, tower_high_u8m1, vector_length);
+    vuint8m1_t low_high_u8m1 = sz_gf16_mul_rvv_(tower_low_u8m1, tower_high_u8m1, log_u8m1, antilog_u8m1, vector_length);
+    vuint8m1_t low_high_a_u8m1 = __riscv_vrgather_vv_u8m1(mul_a_u8m1, low_high_u8m1, vector_length);
+    vuint8m1_t high_squared_b_u8m1 = __riscv_vrgather_vv_u8m1(mul_b_u8m1, high_squared_u8m1, vector_length);
+    vuint8m1_t norm_u8m1 = __riscv_vxor_vv_u8m1(__riscv_vxor_vv_u8m1(low_squared_u8m1, low_high_a_u8m1, vector_length),
+                                                high_squared_b_u8m1, vector_length);
+    vuint8m1_t norm_inverse_u8m1 = __riscv_vrgather_vv_u8m1(inverse4_u8m1, norm_u8m1, vector_length);
+    vuint8m1_t new_high_u8m1 = sz_gf16_mul_rvv_(tower_high_u8m1, norm_inverse_u8m1, log_u8m1, antilog_u8m1,
+                                                vector_length);
+    vuint8m1_t high_a_u8m1 = __riscv_vrgather_vv_u8m1(mul_a_u8m1, tower_high_u8m1, vector_length);
+    vuint8m1_t low_xor_high_a_u8m1 = __riscv_vxor_vv_u8m1(tower_low_u8m1, high_a_u8m1, vector_length);
+    vuint8m1_t new_low_u8m1 = sz_gf16_mul_rvv_(low_xor_high_a_u8m1, norm_inverse_u8m1, log_u8m1, antilog_u8m1,
+                                               vector_length);
+    vuint8m1_t packed_inverse_u8m1 = __riscv_vor_vv_u8m1(__riscv_vsll_vx_u8m1(new_high_u8m1, 4, vector_length),
+                                                         new_low_u8m1, vector_length);
+    vuint8m1_t packed_low_u8m1 = __riscv_vand_vx_u8m1(packed_inverse_u8m1, 0x0f, vector_length);
+    vuint8m1_t packed_high_u8m1 = __riscv_vsrl_vx_u8m1(packed_inverse_u8m1, 4, vector_length);
+    vuint8m1_t sbox_u8m1 = __riscv_vxor_vv_u8m1(__riscv_vrgather_vv_u8m1(glow_u8m1, packed_low_u8m1, vector_length),
+                                                __riscv_vrgather_vv_u8m1(ghigh_u8m1, packed_high_u8m1, vector_length),
+                                                vector_length);
+    sbox_u8m1 = __riscv_vxor_vx_u8m1(sbox_u8m1, 0x63, vector_length);
+    vuint8m1_t shiftrows_index_u8m1 = __riscv_vle8_v_u8m1(sz_aes_shiftrows_rvv_(), vector_length);
+    vuint8m1_t premix_u8m1 = __riscv_vrgather_vv_u8m1(sbox_u8m1, shiftrows_index_u8m1, vector_length);
+    vuint8m1_t rot1_index_u8m1 = __riscv_vle8_v_u8m1(sz_aes_rot1_rvv_(), vector_length);
+    vuint8m1_t premix_next_u8m1 = __riscv_vrgather_vv_u8m1(premix_u8m1, rot1_index_u8m1, vector_length);
+    vuint8m1_t diff_u8m1 = __riscv_vxor_vv_u8m1(premix_u8m1, premix_next_u8m1, vector_length);
+    vuint8m1_t shifted_u8m1 = __riscv_vsll_vx_u8m1(diff_u8m1, 1, vector_length);
+    vbool8_t high_bit_b8 = __riscv_vmsne_vx_u8m1_b8(__riscv_vand_vx_u8m1(diff_u8m1, 0x80, vector_length), 0,
+                                                    vector_length);
+    vuint8m1_t shifted_reduced_u8m1 = __riscv_vxor_vx_u8m1(shifted_u8m1, 0x1b, vector_length);
+    vuint8m1_t xtime_u8m1 = __riscv_vmerge_vvm_u8m1(shifted_u8m1, shifted_reduced_u8m1, high_bit_b8, vector_length);
+    vuint8m1_t group_xor_u8m1 = premix_u8m1;
+    group_xor_u8m1 = __riscv_vxor_vv_u8m1(group_xor_u8m1, premix_next_u8m1, vector_length);
+    vuint8m1_t rot2_index_u8m1 = __riscv_vrgather_vv_u8m1(rot1_index_u8m1, rot1_index_u8m1, vector_length);
+    group_xor_u8m1 = __riscv_vxor_vv_u8m1(
+        group_xor_u8m1, __riscv_vrgather_vv_u8m1(premix_u8m1, rot2_index_u8m1, vector_length), vector_length);
+    vuint8m1_t rot3_index_u8m1 = __riscv_vrgather_vv_u8m1(rot2_index_u8m1, rot1_index_u8m1, vector_length);
+    group_xor_u8m1 = __riscv_vxor_vv_u8m1(
+        group_xor_u8m1, __riscv_vrgather_vv_u8m1(premix_u8m1, rot3_index_u8m1, vector_length), vector_length);
+    vuint8m1_t out_u8m1 = __riscv_vxor_vv_u8m1(__riscv_vxor_vv_u8m1(premix_u8m1, group_xor_u8m1, vector_length),
+                                               xtime_u8m1, vector_length);
+    out_u8m1 = __riscv_vxor_vv_u8m1(out_u8m1, key_u8m1, vector_length);
+    sz_u128_vec_t result_vec;
+    __riscv_vse8_v_u8m1(result_vec.u8s, out_u8m1, vector_length);
+    return result_vec;
+}
+#pragma endregion // RVV AES Round
+#pragma region RVV Hash Drivers
+SZ_HELPER_AUTO void sz_hash_state_short_update_rvv_(sz_hash_state_aligned_for_short_t *state, sz_u128_vec_t block_vec) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    state->aes = sz_emulate_aesenc_rvv_(state->aes, block_vec);
+    state->sum = sz_emulate_shuffle_epi8_serial_(state->sum, shuffle);
+    state->sum.u64s[0] += block_vec.u64s[0], state->sum.u64s[1] += block_vec.u64s[1];
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_short_finalize_rvv_(sz_hash_state_aligned_for_short_t const *state,
+                                                          sz_size_t length) {
+    sz_u128_vec_t key_with_length_vec = state->key;
+    key_with_length_vec.u64s[0] += length;
+    sz_u128_vec_t mixed_vec = sz_emulate_aesenc_rvv_(state->sum, state->aes);
+    sz_u128_vec_t mixed_in_register_vec = sz_emulate_aesenc_rvv_(sz_emulate_aesenc_rvv_(mixed_vec, key_with_length_vec),
+                                                                 mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+/** @brief  Vector-copy a single AES block (`sizeof(sz_u128_vec_t)` bytes) from `source` into `target_vec->u8s`,
+ *          replacing a scalar byte loop. `source` must have a full block of readable bytes. */
+SZ_HELPER_INLINE void sz_hash_load_block_rvv_(sz_u128_vec_t *target_vec, sz_cptr_t source) {
+    sz_size_t vector_length = __riscv_vsetvl_e8m1(sizeof(target_vec->u8s));
+    __riscv_vse8_v_u8m1(target_vec->u8s, __riscv_vle8_v_u8m1((sz_u8_t const *)source, vector_length), vector_length);
+}
+/** @brief  Vector-copy a single AES block (`sizeof(sz_u128_vec_t)` bytes) from `source_vec` to `target`, the store
+ *          counterpart of `sz_hash_load_block_rvv_`. `target` must have a full block of writable bytes. */
+SZ_HELPER_INLINE void sz_hash_store_block_rvv_(sz_ptr_t target, sz_u128_vec_t source_vec) {
+    sz_size_t vector_length = __riscv_vsetvl_e8m1(sizeof(source_vec.u8s));
+    __riscv_vse8_v_u8m1((sz_u8_t *)target, __riscv_vle8_v_u8m1(source_vec.u8s, vector_length), vector_length);
+}
+/**
+ *  @brief Loads the packed public state into the aligned internal twin (one `vle8` block per 16-byte lane).
+ */
+SZ_HELPER_AUTO sz_hash_state_aligned_t sz_hash_state_load_rvv_(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state;
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        sz_hash_load_block_rvv_(&state.aes.u128s[lane_index], (sz_cptr_t)(packed->aes + offset));
+        sz_hash_load_block_rvv_(&state.sum.u128s[lane_index], (sz_cptr_t)(packed->sum + offset));
+        sz_hash_load_block_rvv_(&state.ins.u128s[lane_index], (sz_cptr_t)(packed->ins + offset));
+    }
+    sz_hash_load_block_rvv_(&state.key, (sz_cptr_t)packed->key);
+    state.ins_length = packed->ins_length;
+    return state;
+}
+/** @brief Stores the aligned internal twin back into the packed public state (one `vse8` block per 16-byte lane). */
+SZ_HELPER_AUTO void sz_hash_state_store_rvv_(sz_hash_state_t *packed, sz_hash_state_aligned_t const *state) {
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        sz_hash_store_block_rvv_((sz_ptr_t)(packed->aes + offset), state->aes.u128s[lane_index]);
+        sz_hash_store_block_rvv_((sz_ptr_t)(packed->sum + offset), state->sum.u128s[lane_index]);
+        sz_hash_store_block_rvv_((sz_ptr_t)(packed->ins + offset), state->ins.u128s[lane_index]);
+    }
+    sz_hash_store_block_rvv_((sz_ptr_t)packed->key, state->key);
+    packed->ins_length = state->ins_length;
+}
+SZ_HELPER_AUTO void sz_hash_state_update_rvv_(sz_hash_state_aligned_t *state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        state->aes.u128s[lane_index] = sz_emulate_aesenc_rvv_(state->aes.u128s[lane_index],
+                                                              state->ins.u128s[lane_index]);
+        state->sum.u128s[lane_index] = sz_emulate_shuffle_epi8_serial_(state->sum.u128s[lane_index], shuffle);
+        state->sum.u128s[lane_index].u64s[0] += state->ins.u128s[lane_index].u64s[0];
+        state->sum.u128s[lane_index].u64s[1] += state->ins.u128s[lane_index].u64s[1];
+    }
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_finalize_rvv_(sz_hash_state_aligned_t state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    sz_u128_vec_t key_with_length_vec;
+    key_with_length_vec.u64s[0] = state.key.u64s[0] + state.ins_length;
+    key_with_length_vec.u64s[1] = state.key.u64s[1];
+    sz_u128_vec_t aes0_vec = sz_emulate_aesenc_rvv_(state.aes.u128s[0], state.ins.u128s[0]);
+    sz_u128_vec_t aes1_vec = sz_emulate_aesenc_rvv_(state.aes.u128s[1], state.ins.u128s[1]);
+    sz_u128_vec_t aes2_vec = sz_emulate_aesenc_rvv_(state.aes.u128s[2], state.ins.u128s[2]);
+    sz_u128_vec_t aes3_vec = sz_emulate_aesenc_rvv_(state.aes.u128s[3], state.ins.u128s[3]);
+    sz_u128_vec_t sum0_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[0], shuffle);
+    sz_u128_vec_t sum1_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[1], shuffle);
+    sz_u128_vec_t sum2_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[2], shuffle);
+    sz_u128_vec_t sum3_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[3], shuffle);
+    sum0_vec.u64s[0] += state.ins.u128s[0].u64s[0], sum0_vec.u64s[1] += state.ins.u128s[0].u64s[1];
+    sum1_vec.u64s[0] += state.ins.u128s[1].u64s[0], sum1_vec.u64s[1] += state.ins.u128s[1].u64s[1];
+    sum2_vec.u64s[0] += state.ins.u128s[2].u64s[0], sum2_vec.u64s[1] += state.ins.u128s[2].u64s[1];
+    sum3_vec.u64s[0] += state.ins.u128s[3].u64s[0], sum3_vec.u64s[1] += state.ins.u128s[3].u64s[1];
+    sz_u128_vec_t mixed0_vec = sz_emulate_aesenc_rvv_(sum0_vec, aes0_vec);
+    sz_u128_vec_t mixed1_vec = sz_emulate_aesenc_rvv_(sum1_vec, aes1_vec);
+    sz_u128_vec_t mixed2_vec = sz_emulate_aesenc_rvv_(sum2_vec, aes2_vec);
+    sz_u128_vec_t mixed3_vec = sz_emulate_aesenc_rvv_(sum3_vec, aes3_vec);
+    sz_u128_vec_t mixed01_vec = sz_emulate_aesenc_rvv_(mixed0_vec, mixed1_vec);
+    sz_u128_vec_t mixed23_vec = sz_emulate_aesenc_rvv_(mixed2_vec, mixed3_vec);
+    sz_u128_vec_t mixed_vec = sz_emulate_aesenc_rvv_(mixed01_vec, mixed23_vec);
+    sz_u128_vec_t mixed_in_register_vec = sz_emulate_aesenc_rvv_(sz_emulate_aesenc_rvv_(mixed_vec, key_with_length_vec),
+                                                                 mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+SZ_API_COMPTIME SZ_NO_STACK_PROTECTOR sz_u64_t sz_hash_rvv(sz_cptr_t start, sz_size_t length, sz_u64_t seed) {
+    sz_size_t const block = sizeof(sz_u128_vec_t); 
+    if (length <= block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data_vec;
+        data_vec.u64s[0] = data_vec.u64s[1] = 0;
+        sz_size_t vector_length = __riscv_vsetvl_e8m1(length);
+        __riscv_vse8_v_u8m1(data_vec.u8s, __riscv_vle8_v_u8m1((sz_u8_t const *)start, vector_length), vector_length);
+        sz_hash_state_short_update_rvv_(&state, data_vec);
+        return sz_hash_state_short_finalize_rvv_(&state, length);
+    }
+    else if (length <= 2 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec;
+        sz_hash_load_block_rvv_(&data0_vec, start);
+        sz_hash_load_block_rvv_(&data1_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data1_vec, (int)(2 * block - length));
+        sz_hash_state_short_update_rvv_(&state, data0_vec);
+        sz_hash_state_short_update_rvv_(&state, data1_vec);
+        return sz_hash_state_short_finalize_rvv_(&state, length);
+    }
+    else if (length <= 3 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec;
+        sz_hash_load_block_rvv_(&data0_vec, start);
+        sz_hash_load_block_rvv_(&data1_vec, start + block);
+        sz_hash_load_block_rvv_(&data2_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data2_vec, (int)(3 * block - length));
+        sz_hash_state_short_update_rvv_(&state, data0_vec);
+        sz_hash_state_short_update_rvv_(&state, data1_vec);
+        sz_hash_state_short_update_rvv_(&state, data2_vec);
+        return sz_hash_state_short_finalize_rvv_(&state, length);
+    }
+    else if (length <= 4 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec, data3_vec;
+        sz_hash_load_block_rvv_(&data0_vec, start);
+        sz_hash_load_block_rvv_(&data1_vec, start + block);
+        sz_hash_load_block_rvv_(&data2_vec, start + 2 * block);
+        sz_hash_load_block_rvv_(&data3_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data3_vec, (int)(4 * block - length));
+        sz_hash_state_short_update_rvv_(&state, data0_vec);
+        sz_hash_state_short_update_rvv_(&state, data1_vec);
+        sz_hash_state_short_update_rvv_(&state, data2_vec);
+        sz_hash_state_short_update_rvv_(&state, data3_vec);
+        return sz_hash_state_short_finalize_rvv_(&state, length);
+    }
+    else {
+        sz_align_(64) sz_hash_state_aligned_t state;
+        sz_size_t const window = sizeof(state.ins.u8s); 
+        sz_hash_state_init_serial((sz_hash_state_t *)&state, seed);
+        for (; state.ins_length + window < length; state.ins_length += window) {
+            sz_size_t vector_length = __riscv_vsetvl_e8m8(window); 
+            __riscv_vse8_v_u8m8(state.ins.u8s,
+                                __riscv_vle8_v_u8m8((sz_u8_t const *)start + state.ins_length, vector_length),
+                                vector_length);
+            sz_hash_state_update_rvv_(&state);
+        }
+        sz_size_t zero_vl = __riscv_vsetvl_e8m8(window);
+        __riscv_vse8_v_u8m8(state.ins.u8s, __riscv_vmv_v_x_u8m8(0, zero_vl), zero_vl);
+        sz_size_t tail_vl = __riscv_vsetvl_e8m8(length - state.ins_length); 
+        __riscv_vse8_v_u8m8(state.ins.u8s, __riscv_vle8_v_u8m8((sz_u8_t const *)start + state.ins_length, tail_vl),
+                            tail_vl);
+        state.ins_length = length;
+        return sz_hash_state_finalize_rvv_(state);
+    }
+}
+SZ_API_COMPTIME void sz_hash_state_init_rvv(sz_hash_state_t *state, sz_u64_t seed) {
+    sz_hash_state_init_serial(state, seed);
+}
+SZ_API_COMPTIME void sz_hash_state_update_rvv(sz_hash_state_t *packed, sz_cptr_t text, sz_size_t length) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_rvv_(packed);
+    sz_size_t buffered = state.ins_length % 64;
+    if (buffered == 0 && state.ins_length) buffered = 64;
+    sz_size_t const window_length = __riscv_vsetvl_e8m8(sizeof(state.ins.u8s));
+    vuint8m8_t const lane_index_u8m8 = __riscv_vid_v_u8m8(window_length);
+    vuint8m8_t ins_u8m8 = __riscv_vle8_v_u8m8(state.ins.u8s, window_length);
+    while (length) {
+        if (buffered == 64) { 
+            __riscv_vse8_v_u8m8(state.ins.u8s, ins_u8m8, window_length);
+            sz_hash_state_update_rvv_(&state);
+            ins_u8m8 = __riscv_vmv_v_x_u8m8(0, window_length);
+            buffered = 0;
+        }
+        sz_size_t const take_length = sz_min_of_two(length, (sz_size_t)64 - buffered);
+        sz_size_t const take_vector_length = __riscv_vsetvl_e8m8(take_length); 
+        vuint8m8_t const incoming_u8m8 = __riscv_vle8_v_u8m8((sz_u8_t const *)text, take_vector_length);
+        vuint8m8_t const slid_u8m8 = __riscv_vslideup_vx_u8m8(__riscv_vundefined_u8m8(), incoming_u8m8, buffered,
+                                                              window_length);
+        vbool1_t const at_or_after_b1 = __riscv_vmsgeu_vx_u8m8_b1(lane_index_u8m8, (sz_u8_t)buffered, window_length);
+        vbool1_t const before_end_b1 = __riscv_vmsltu_vx_u8m8_b1(lane_index_u8m8, (sz_u8_t)(buffered + take_length),
+                                                                 window_length);
+        vbool1_t const place_b1 = __riscv_vmand_mm_b1(at_or_after_b1, before_end_b1, window_length);
+        ins_u8m8 = __riscv_vmerge_vvm_u8m8(ins_u8m8, slid_u8m8, place_b1, window_length);
+        buffered += take_length, text += take_length, length -= take_length, state.ins_length += take_length;
+    }
+    __riscv_vse8_v_u8m8(state.ins.u8s, ins_u8m8, window_length); 
+    sz_hash_state_store_rvv_(packed, &state);
+}
+SZ_API_COMPTIME sz_u64_t sz_hash_state_digest_rvv(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_rvv_(packed);
+    sz_size_t length = state.ins_length;
+    if (length > 64) return sz_hash_state_finalize_rvv_(state);
+    sz_hash_state_aligned_for_short_t minimal_state;
+    minimal_state.key = state.key;
+    minimal_state.aes = state.aes.u128s[0];
+    minimal_state.sum = state.sum.u128s[0];
+    if (length <= 16) {
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[0]);
+        return sz_hash_state_short_finalize_rvv_(&minimal_state, length);
+    }
+    else if (length <= 32) {
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[1]);
+        return sz_hash_state_short_finalize_rvv_(&minimal_state, length);
+    }
+    else if (length <= 48) {
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[2]);
+        return sz_hash_state_short_finalize_rvv_(&minimal_state, length);
+    }
+    else {
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[2]);
+        sz_hash_state_short_update_rvv_(&minimal_state, state.ins.u128s[3]);
+        return sz_hash_state_short_finalize_rvv_(&minimal_state, length);
+    }
+}
+SZ_API_COMPTIME void sz_fill_random_rvv(sz_ptr_t text, sz_size_t length, sz_u64_t nonce) {
+    sz_u64_t const *pi_constants = sz_hash_pi_constants_();
+    sz_u128_vec_t input_vec, pi_vec, key_vec, generated_vec;
+    for (sz_size_t lane_index = 0; length; ++lane_index) {
+        input_vec.u64s[0] = input_vec.u64s[1] = nonce + lane_index;
+        pi_vec = ((sz_u128_vec_t const *)pi_constants)[lane_index % 4];
+        key_vec.u64s[0] = nonce ^ pi_vec.u64s[0];
+        key_vec.u64s[1] = nonce ^ pi_vec.u64s[1];
+        generated_vec = sz_emulate_aesenc_rvv_(input_vec, key_vec);
+        sz_size_t out_vl = __riscv_vsetvl_e8m1(sz_min_of_two(length, sizeof(generated_vec.u8s)));
+        __riscv_vse8_v_u8m1((sz_u8_t *)text, __riscv_vle8_v_u8m1(generated_vec.u8s, out_vl), out_vl);
+        text += out_vl, length -= out_vl;
+    }
+}
+#pragma endregion // RVV Hash Drivers
+SZ_API_COMPTIME void sz_sha256_state_init_rvv(sz_sha256_state_t *state_ptr) { sz_sha256_state_init_serial(state_ptr); }
+SZ_API_COMPTIME void sz_sha256_state_update_rvv(sz_sha256_state_t *state_ptr, sz_cptr_t data, sz_size_t length) {
+    sz_sha256_state_update_serial(state_ptr, data, length);
+}
+SZ_API_COMPTIME void sz_sha256_state_digest_rvv(sz_sha256_state_t const *state_ptr,
+                                                sz_u8_t digest[sz_at_least_(SZ_SHA256_DIGEST_LENGTH)]) {
+    sz_sha256_state_digest_serial(state_ptr, digest);
+}
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+#endif 
+#ifdef __cplusplus
+}
+#endif
+#endif 

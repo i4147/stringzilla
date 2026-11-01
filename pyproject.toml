@@ -1,0 +1,118 @@
+[build-system]
+backend-path = ["."]
+build-backend = "build_backend"
+requires = ["setuptools>=61", "wheel"]
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
+filterwarnings = ["error"]
+python_files = ["*.py"]
+testpaths = ["test"]
+xfail_strict = true
+[dependency-groups]
+differential = ["pycryptodome"]
+[tool.black]
+line-length = 120
+[tool.cibuildwheel]
+before-test = ["python {project}/build_backend.py pull-deps {project}"]
+build-verbosity = 0
+test-command = "python {project}/build_backend.py run-tests {project}"
+test-requires = ["pytest", "pytest-repeat", "pytest-run-parallel"]
+archs = ["all"]
+skip = ["*-macos*_universal2"]
+enable = []
+environment-pass = ["SZ_TARGET", "SZ_IS_QEMU_", "SZ_TESTS_MULTIPLIER", "PYTHONFAULTHANDLER", "PYTHONMALLOC"]
+[tool.cibuildwheel.linux]
+before-build = ["rm -rf {project}/build"]
+repair-wheel-command = "auditwheel repair --lib-sdir . -w {dest_dir} {wheel}"
+manylinux-aarch64-image = "manylinux_2_28"
+manylinux-ppc64le-image = "manylinux_2_28"
+manylinux-s390x-image = "manylinux_2_28"
+manylinux-x86_64-image = "manylinux_2_28"
+musllinux-aarch64-image = "musllinux_1_2"
+musllinux-i686-image = "musllinux_1_2"
+musllinux-ppc64le-image = "musllinux_1_2"
+musllinux-s390x-image = "musllinux_1_2"
+musllinux-x86_64-image = "musllinux_1_2"
+manylinux-riscv64-image = "quay.io/pypa/manylinux_2_39_riscv64:2026.09.01-1"
+musllinux-riscv64-image = "quay.io/pypa/musllinux_1_2_riscv64:2026.09.01-1"
+before-all = ["""
+    (yum update -y && yum install -y glibc-devel wget python3-devel) || \
+    (dnf update -y && dnf install -y glibc-devel wget python3-devel) || \
+    (apt-get update && apt-get install -y libc6-dev wget python3-dev)
+    """]
+[[tool.cibuildwheel.overrides]]
+before-all = "apk add --update wget python3-dev"
+select = "*-musllinux*"
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+before-build = ["rm -rf {project}/build"]
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+[tool.cibuildwheel.windows]
+before-build = ["rd /s /q {project}\\build || echo Done"]
+repair-wheel-command = ""
+[[tool.cibuildwheel.overrides]]
+before-all = "dnf install -y glibc-devel wget python3-devel clang lld"
+environment.CC = "clang"
+environment.CXX = "clang++"
+environment.LDFLAGS = "-fuse-ld=lld"
+inherit.environment = "append"
+select = "*-manylinux*_riscv64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_USE_RVV = "0"
+inherit.environment = "append"
+select = "*-musllinux*_riscv64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "0"
+environment.SZ_IS_64BIT_X86_ = "0"
+inherit.environment = "append"
+select = "*-pyodide*"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "0"
+environment.SZ_IS_64BIT_X86_ = "1"
+inherit.environment = "append"
+select = "*-win_amd64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "0"
+environment.SZ_IS_64BIT_X86_ = "1"
+inherit.environment = "append"
+select = "*-manylinux*_x86_64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "0"
+environment.SZ_IS_64BIT_X86_ = "1"
+inherit.environment = "append"
+select = "*-musllinux*_x86_64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "1"
+environment.SZ_IS_64BIT_X86_ = "0"
+inherit.environment = "append"
+select = "*-win_arm64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "1"
+environment.SZ_IS_64BIT_X86_ = "0"
+inherit.environment = "append"
+select = "*-manylinux*_aarch64"
+[[tool.cibuildwheel.overrides]]
+environment.SZ_IS_64BIT_ARM_ = "1"
+environment.SZ_IS_64BIT_X86_ = "0"
+inherit.environment = "append"
+select = "*-musllinux*_aarch64"
+[[tool.cibuildwheel.overrides]]
+environment.MACOSX_DEPLOYMENT_TARGET = "11.0"
+environment.SZ_IS_64BIT_ARM_ = "0"
+environment.SZ_IS_64BIT_X86_ = "1"
+inherit.environment = "append"
+select = "*-macos*_x86_64"
+[[tool.cibuildwheel.overrides]]
+environment.MACOSX_DEPLOYMENT_TARGET = "11.0"
+environment.SZ_IS_64BIT_ARM_ = "1"
+environment.SZ_IS_64BIT_X86_ = "0"
+inherit.environment = "append"
+select = "*-macos*_arm64"
+[tool.ruff]
+extend-select = [
+    "E",
+    "F",
+]
+line-length = 120
+target-version = "py310"

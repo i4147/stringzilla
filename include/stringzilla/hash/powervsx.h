@@ -1,0 +1,355 @@
+/**
+ *  @brief IBM Power VSX backend for hash.
+ *  @file include/stringzilla/hash/powervsx.h
+ *  @author Ash Vardanian
+ *  @sa include/stringzilla/hash.h
+ */
+#ifndef STRINGZILLA_HASH_POWERVSX_H_
+#define STRINGZILLA_HASH_POWERVSX_H_
+#include "stringzilla/types.h"
+#include "stringzilla/hash/serial.h"
+#include "stringzilla/compare.h" 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#if SZ_USE_POWERVSX
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("power9-vector"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("power9-vector")
+#endif
+SZ_API_COMPTIME sz_u64_t sz_bytesum_powervsx(sz_cptr_t text, sz_size_t length) {
+    sz_u64_t sum = 0;
+    __vector unsigned char const ones_u8x16 = vec_splats((unsigned char)1);
+    sz_size_t const block_windows = (sz_size_t)4000000; 
+    while (length >= 16) {
+        sz_size_t windows = length / 16;
+        if (windows > block_windows) windows = block_windows;
+        __vector unsigned int accumulator_u32x4 = vec_splats((unsigned int)0);
+        for (sz_size_t window_index = 0; window_index < windows; ++window_index, text += 16) {
+            __vector unsigned char bytes_u8x16 = vec_xl(0, (unsigned char const *)text);
+            accumulator_u32x4 = vec_msum(bytes_u8x16, ones_u8x16,
+                                         accumulator_u32x4); 
+        }
+        sum += (sz_u64_t)accumulator_u32x4[0] + accumulator_u32x4[1] + accumulator_u32x4[2] + accumulator_u32x4[3];
+        length -= windows * 16;
+    }
+    while (length--) sum += *(sz_u8_t const *)text++;
+    return sum;
+}
+#pragma region AES based hashing
+#if !SZ_IS_BIG_ENDIAN_
+/** @brief Byte-reverse permutation selector for a 16-byte VSX register. */
+SZ_HELPER_INLINE __vector unsigned char sz_aes_byte_reverse_mask_powervsx_(void) {
+    __vector unsigned char const mask_u8x16 = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+    return mask_u8x16;
+}
+/**
+ *  @brief Bit-exact VSX equivalent of `sz_emulate_aesenc_si128_serial_` using hardware AES.
+ *  @return `MixColumns(SubBytes(ShiftRows(state))) ^ round_key`, identical to the serial reference.
+ */
+SZ_HELPER_AUTO sz_u128_vec_t sz_aesenc_powervsx_(sz_u128_vec_t state_vec, sz_u128_vec_t round_key_vec) {
+    __vector unsigned char const rev_u8x16 = sz_aes_byte_reverse_mask_powervsx_();
+    __vector unsigned char state_u8x16 = state_vec.vsx_u8;
+    __vector unsigned char reversed_u8x16 = vec_perm(state_u8x16, state_u8x16, rev_u8x16);
+    __vector unsigned char zero_u8x16 = vec_splats((unsigned char)0);
+#if defined(__clang__)
+    typedef __vector unsigned char sz_vcipher_operand_t;
+#else
+    typedef __vector unsigned long long sz_vcipher_operand_t;
+#endif
+    __vector unsigned char ciphered_u8x16 = (__vector unsigned char)__builtin_crypto_vcipher(
+        (sz_vcipher_operand_t)reversed_u8x16, (sz_vcipher_operand_t)zero_u8x16);
+    __vector unsigned char restored_u8x16 = vec_perm(ciphered_u8x16, ciphered_u8x16, rev_u8x16);
+    sz_u128_vec_t result_vec;
+    result_vec.vsx_u8 = restored_u8x16;
+    result_vec.u64s[0] ^= round_key_vec.u64s[0];
+    result_vec.u64s[1] ^= round_key_vec.u64s[1];
+    return result_vec;
+}
+/** @brief Bit-exact VSX equivalent of `sz_emulate_shuffle_epi8_serial_` via `vec_perm`. */
+SZ_HELPER_INLINE sz_u128_vec_t sz_shuffle_epi8_powervsx_(sz_u128_vec_t state_vec,
+                                                         sz_u8_t const order[sz_at_least_(16)]) {
+    __vector unsigned char order_u8x16 = vec_xl(0, (unsigned char const *)order);
+    sz_u128_vec_t result_vec;
+    result_vec.vsx_u8 = vec_perm(state_vec.vsx_u8, state_vec.vsx_u8, order_u8x16);
+    return result_vec;
+}
+#pragma region Minimal state for short inputs
+SZ_HELPER_AUTO void sz_hash_state_short_update_powervsx_(sz_hash_state_aligned_for_short_t *state,
+                                                         sz_u128_vec_t block_vec) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    state->aes = sz_aesenc_powervsx_(state->aes, block_vec);
+    state->sum = sz_shuffle_epi8_powervsx_(state->sum, shuffle);
+    state->sum.u64s[0] += block_vec.u64s[0], state->sum.u64s[1] += block_vec.u64s[1];
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_short_finalize_powervsx_(sz_hash_state_aligned_for_short_t const *state,
+                                                               sz_size_t length) {
+    sz_u128_vec_t key_with_length_vec = state->key;
+    key_with_length_vec.u64s[0] += length;
+    sz_u128_vec_t mixed_vec = sz_aesenc_powervsx_(state->sum, state->aes);
+    sz_u128_vec_t mixed_in_register_vec = sz_aesenc_powervsx_(sz_aesenc_powervsx_(mixed_vec, key_with_length_vec),
+                                                              mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+#pragma endregion
+#pragma region Full state for long inputs
+SZ_API_COMPTIME void sz_hash_state_init_powervsx(sz_hash_state_t *state, sz_u64_t seed) {
+    sz_u64_t *key_u64s = (sz_u64_t *)state->key;
+    key_u64s[0] = seed;
+    key_u64s[1] = seed;
+    sz_u64_t const *pi_constants = sz_hash_pi_constants_();
+    sz_u64_t *aes_u64s = (sz_u64_t *)state->aes;
+    sz_u64_t *sum_u64s = (sz_u64_t *)state->sum;
+    for (sz_size_t lane_index = 0; lane_index < 8; ++lane_index) aes_u64s[lane_index] = seed ^ pi_constants[lane_index];
+    for (sz_size_t lane_index = 0; lane_index < 8; ++lane_index)
+        sum_u64s[lane_index] = seed ^ pi_constants[lane_index + 8];
+    for (sz_size_t byte_index = 0; byte_index < 64; ++byte_index) state->ins[byte_index] = 0;
+    state->ins_length = 0;
+}
+/**
+ *  @brief Loads the packed public state into the aligned internal twin (4x `vec_xl` per 64-byte field).
+ */
+SZ_HELPER_AUTO sz_hash_state_aligned_t sz_hash_state_load_powervsx_(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state;
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        state.aes.u128s[lane_index].vsx_u8 = vec_xl(0, (unsigned char const *)(packed->aes + offset));
+        state.sum.u128s[lane_index].vsx_u8 = vec_xl(0, (unsigned char const *)(packed->sum + offset));
+        state.ins.u128s[lane_index].vsx_u8 = vec_xl(0, (unsigned char const *)(packed->ins + offset));
+    }
+    state.key.vsx_u8 = vec_xl(0, (unsigned char const *)packed->key);
+    state.ins_length = packed->ins_length;
+    return state;
+}
+/** @brief Stores the aligned internal twin back into the packed public state (4x `vec_xst` per 64-byte field). */
+SZ_HELPER_AUTO void sz_hash_state_store_powervsx_(sz_hash_state_t *packed, sz_hash_state_aligned_t const *state) {
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        vec_xst(state->aes.u128s[lane_index].vsx_u8, 0, (unsigned char *)(packed->aes + offset));
+        vec_xst(state->sum.u128s[lane_index].vsx_u8, 0, (unsigned char *)(packed->sum + offset));
+        vec_xst(state->ins.u128s[lane_index].vsx_u8, 0, (unsigned char *)(packed->ins + offset));
+    }
+    vec_xst(state->key.vsx_u8, 0, (unsigned char *)packed->key);
+    packed->ins_length = state->ins_length;
+}
+SZ_HELPER_AUTO void sz_hash_state_update_powervsx_(sz_hash_state_aligned_t *state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        state->aes.u128s[lane_index] = sz_aesenc_powervsx_(state->aes.u128s[lane_index], state->ins.u128s[lane_index]);
+        state->sum.u128s[lane_index] = sz_shuffle_epi8_powervsx_(state->sum.u128s[lane_index], shuffle);
+        state->sum.u128s[lane_index].u64s[0] += state->ins.u128s[lane_index].u64s[0];
+        state->sum.u128s[lane_index].u64s[1] += state->ins.u128s[lane_index].u64s[1];
+    }
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_finalize_powervsx_(sz_hash_state_aligned_t state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    sz_u128_vec_t key_with_length_vec;
+    key_with_length_vec.u64s[0] = state.key.u64s[0] + state.ins_length;
+    key_with_length_vec.u64s[1] = state.key.u64s[1];
+    sz_u128_vec_t aes0_vec = sz_aesenc_powervsx_(state.aes.u128s[0], state.ins.u128s[0]);
+    sz_u128_vec_t aes1_vec = sz_aesenc_powervsx_(state.aes.u128s[1], state.ins.u128s[1]);
+    sz_u128_vec_t aes2_vec = sz_aesenc_powervsx_(state.aes.u128s[2], state.ins.u128s[2]);
+    sz_u128_vec_t aes3_vec = sz_aesenc_powervsx_(state.aes.u128s[3], state.ins.u128s[3]);
+    sz_u128_vec_t sum0_vec = sz_shuffle_epi8_powervsx_(state.sum.u128s[0], shuffle);
+    sz_u128_vec_t sum1_vec = sz_shuffle_epi8_powervsx_(state.sum.u128s[1], shuffle);
+    sz_u128_vec_t sum2_vec = sz_shuffle_epi8_powervsx_(state.sum.u128s[2], shuffle);
+    sz_u128_vec_t sum3_vec = sz_shuffle_epi8_powervsx_(state.sum.u128s[3], shuffle);
+    sum0_vec.u64s[0] += state.ins.u128s[0].u64s[0], sum0_vec.u64s[1] += state.ins.u128s[0].u64s[1];
+    sum1_vec.u64s[0] += state.ins.u128s[1].u64s[0], sum1_vec.u64s[1] += state.ins.u128s[1].u64s[1];
+    sum2_vec.u64s[0] += state.ins.u128s[2].u64s[0], sum2_vec.u64s[1] += state.ins.u128s[2].u64s[1];
+    sum3_vec.u64s[0] += state.ins.u128s[3].u64s[0], sum3_vec.u64s[1] += state.ins.u128s[3].u64s[1];
+    sz_u128_vec_t mixed0_vec = sz_aesenc_powervsx_(sum0_vec, aes0_vec);
+    sz_u128_vec_t mixed1_vec = sz_aesenc_powervsx_(sum1_vec, aes1_vec);
+    sz_u128_vec_t mixed2_vec = sz_aesenc_powervsx_(sum2_vec, aes2_vec);
+    sz_u128_vec_t mixed3_vec = sz_aesenc_powervsx_(sum3_vec, aes3_vec);
+    sz_u128_vec_t mixed01_vec = sz_aesenc_powervsx_(mixed0_vec, mixed1_vec);
+    sz_u128_vec_t mixed23_vec = sz_aesenc_powervsx_(mixed2_vec, mixed3_vec);
+    sz_u128_vec_t mixed_vec = sz_aesenc_powervsx_(mixed01_vec, mixed23_vec);
+    sz_u128_vec_t mixed_in_register_vec = sz_aesenc_powervsx_(sz_aesenc_powervsx_(mixed_vec, key_with_length_vec),
+                                                              mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+#pragma endregion
+SZ_API_COMPTIME SZ_NO_STACK_PROTECTOR sz_u64_t sz_hash_powervsx(sz_cptr_t start, sz_size_t length, sz_u64_t seed) {
+    if (length <= 16) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data_vec;
+        data_vec.u64s[0] = data_vec.u64s[1] = 0;
+        for (sz_size_t byte_index = 0; byte_index < length; ++byte_index) data_vec.u8s[byte_index] = start[byte_index];
+        sz_hash_state_short_update_powervsx_(&state, data_vec);
+        return sz_hash_state_short_finalize_powervsx_(&state, length);
+    }
+    else if (length <= 32) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec;
+        data0_vec.u64s[0] = data0_vec.u64s[1] = 0;
+        data1_vec.u64s[0] = data1_vec.u64s[1] = 0;
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index) data0_vec.u8s[byte_index] = start[byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data1_vec.u8s[byte_index] = start[length - 16 + byte_index];
+        sz_hash_shift_in_register_serial_(&data1_vec, (int)(32 - length));
+        sz_hash_state_short_update_powervsx_(&state, data0_vec);
+        sz_hash_state_short_update_powervsx_(&state, data1_vec);
+        return sz_hash_state_short_finalize_powervsx_(&state, length);
+    }
+    else if (length <= 48) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec;
+        data0_vec.u64s[0] = data0_vec.u64s[1] = 0;
+        data1_vec.u64s[0] = data1_vec.u64s[1] = 0;
+        data2_vec.u64s[0] = data2_vec.u64s[1] = 0;
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index) data0_vec.u8s[byte_index] = start[byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data1_vec.u8s[byte_index] = start[16 + byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data2_vec.u8s[byte_index] = start[length - 16 + byte_index];
+        sz_hash_shift_in_register_serial_(&data2_vec, (int)(48 - length));
+        sz_hash_state_short_update_powervsx_(&state, data0_vec);
+        sz_hash_state_short_update_powervsx_(&state, data1_vec);
+        sz_hash_state_short_update_powervsx_(&state, data2_vec);
+        return sz_hash_state_short_finalize_powervsx_(&state, length);
+    }
+    else if (length <= 64) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec, data3_vec;
+        data0_vec.u64s[0] = data0_vec.u64s[1] = 0;
+        data1_vec.u64s[0] = data1_vec.u64s[1] = 0;
+        data2_vec.u64s[0] = data2_vec.u64s[1] = 0;
+        data3_vec.u64s[0] = data3_vec.u64s[1] = 0;
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index) data0_vec.u8s[byte_index] = start[byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data1_vec.u8s[byte_index] = start[16 + byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data2_vec.u8s[byte_index] = start[32 + byte_index];
+        for (sz_size_t byte_index = 0; byte_index < 16; ++byte_index)
+            data3_vec.u8s[byte_index] = start[length - 16 + byte_index];
+        sz_hash_shift_in_register_serial_(&data3_vec, (int)(64 - length));
+        sz_hash_state_short_update_powervsx_(&state, data0_vec);
+        sz_hash_state_short_update_powervsx_(&state, data1_vec);
+        sz_hash_state_short_update_powervsx_(&state, data2_vec);
+        sz_hash_state_short_update_powervsx_(&state, data3_vec);
+        return sz_hash_state_short_finalize_powervsx_(&state, length);
+    }
+    else {
+        sz_align_(64) sz_hash_state_aligned_t state;
+        sz_hash_state_init_powervsx((sz_hash_state_t *)&state, seed);
+        for (; state.ins_length + 64 < length; state.ins_length += 64) {
+            for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index)
+                state.ins.u128s[lane_index].vsx_u8 = vec_xl(
+                    0, (unsigned char const *)(start + state.ins_length + lane_index * 16));
+            sz_hash_state_update_powervsx_(&state);
+        }
+        for (sz_size_t byte_index = 0; byte_index != 64; ++byte_index) state.ins.u8s[byte_index] = 0;
+        for (sz_size_t byte_index = 0; state.ins_length < length; ++byte_index, ++state.ins_length)
+            state.ins.u8s[byte_index] = (sz_u8_t)start[state.ins_length];
+        return sz_hash_state_finalize_powervsx_(state);
+    }
+}
+SZ_API_COMPTIME void sz_hash_state_update_powervsx(sz_hash_state_t *packed, sz_cptr_t text, sz_size_t length) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_powervsx_(packed);
+    while (length) {
+        sz_size_t progress_in_block = state.ins_length % 64;
+        if (progress_in_block == 0 && state.ins_length != 0) {
+            sz_hash_state_update_powervsx_(&state);
+            for (sz_size_t byte_index = 0; byte_index < 64; ++byte_index) state.ins.u8s[byte_index] = 0;
+        }
+        sz_size_t to_copy = sz_min_of_two(length, 64 - progress_in_block);
+        state.ins_length += to_copy;
+        length -= to_copy;
+        while (to_copy--) state.ins.u8s[progress_in_block++] = (sz_u8_t)*text++;
+    }
+    sz_hash_state_store_powervsx_(packed, &state);
+}
+SZ_API_COMPTIME sz_u64_t sz_hash_state_digest_powervsx(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_powervsx_(packed);
+    sz_size_t length = state.ins_length;
+    if (length > 64) return sz_hash_state_finalize_powervsx_(state);
+    sz_hash_state_aligned_for_short_t minimal_state;
+    minimal_state.key = state.key;
+    minimal_state.aes = state.aes.u128s[0];
+    minimal_state.sum = state.sum.u128s[0];
+    if (length <= 16) {
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[0]);
+        return sz_hash_state_short_finalize_powervsx_(&minimal_state, length);
+    }
+    else if (length <= 32) {
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[1]);
+        return sz_hash_state_short_finalize_powervsx_(&minimal_state, length);
+    }
+    else if (length <= 48) {
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[2]);
+        return sz_hash_state_short_finalize_powervsx_(&minimal_state, length);
+    }
+    else {
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[2]);
+        sz_hash_state_short_update_powervsx_(&minimal_state, state.ins.u128s[3]);
+        return sz_hash_state_short_finalize_powervsx_(&minimal_state, length);
+    }
+}
+SZ_API_COMPTIME void sz_fill_random_powervsx(sz_ptr_t text, sz_size_t length, sz_u64_t nonce) {
+    sz_u64_t const *pi_constants = sz_hash_pi_constants_();
+    sz_u128_vec_t input_vec, pi_vec, key_vec, generated_vec;
+    for (sz_size_t lane_index = 0; length; ++lane_index) {
+        input_vec.u64s[0] = input_vec.u64s[1] = nonce + lane_index;
+        pi_vec = ((sz_u128_vec_t const *)pi_constants)[lane_index % 4];
+        key_vec.u64s[0] = nonce ^ pi_vec.u64s[0];
+        key_vec.u64s[1] = nonce ^ pi_vec.u64s[1];
+        generated_vec = sz_aesenc_powervsx_(input_vec, key_vec);
+        for (sz_size_t byte_index = 0; byte_index < 16 && length; ++byte_index, --length)
+            *text++ = generated_vec.u8s[byte_index];
+    }
+}
+#else 
+/** @brief Big-endian Power stub: delegates to `sz_hash_serial` to preserve bit-exact digests. */
+SZ_API_COMPTIME sz_u64_t sz_hash_powervsx(sz_cptr_t start, sz_size_t length, sz_u64_t seed) {
+    return sz_hash_serial(start, length, seed);
+}
+/** @brief Big-endian Power stub: delegates to `sz_hash_state_init_serial`. */
+SZ_API_COMPTIME void sz_hash_state_init_powervsx(sz_hash_state_t *state, sz_u64_t seed) {
+    sz_hash_state_init_serial(state, seed);
+}
+/** @brief Big-endian Power stub: delegates to `sz_hash_state_update_serial`. */
+SZ_API_COMPTIME void sz_hash_state_update_powervsx(sz_hash_state_t *state, sz_cptr_t text, sz_size_t length) {
+    sz_hash_state_update_serial(state, text, length);
+}
+/** @brief Big-endian Power stub: delegates to `sz_hash_state_digest_serial`. */
+SZ_API_COMPTIME sz_u64_t sz_hash_state_digest_powervsx(sz_hash_state_t const *state) {
+    return sz_hash_state_digest_serial(state);
+}
+/** @brief Big-endian Power stub: delegates to `sz_fill_random_serial`. */
+SZ_API_COMPTIME void sz_fill_random_powervsx(sz_ptr_t text, sz_size_t length, sz_u64_t nonce) {
+    sz_fill_random_serial(text, length, nonce);
+}
+#endif 
+#pragma endregion // AES based hashing
+#pragma region SHA256
+SZ_API_COMPTIME void sz_sha256_state_init_powervsx(sz_sha256_state_t *state) { sz_sha256_state_init_serial(state); }
+SZ_API_COMPTIME void sz_sha256_state_update_powervsx(sz_sha256_state_t *state, sz_cptr_t data, sz_size_t length) {
+    sz_sha256_state_update_serial(state, data, length);
+}
+SZ_API_COMPTIME void sz_sha256_state_digest_powervsx(sz_sha256_state_t const *state,
+                                                     sz_u8_t digest[sz_at_least_(SZ_SHA256_DIGEST_LENGTH)]) {
+    sz_sha256_state_digest_serial(state, digest);
+}
+#pragma endregion // SHA256
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+#endif 
+#ifdef __cplusplus
+}
+#endif
+#endif 

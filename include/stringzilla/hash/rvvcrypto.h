@@ -1,0 +1,449 @@
+/**
+ *  @brief RISC-V Vector Crypto (Zvk) backend for hash: hardware AES & SHA-256.
+ *  @file include/stringzilla/hash/rvvcrypto.h
+ *  @author Ash Vardanian
+ *  @sa include/stringzilla/hash.h
+ *
+ *  This backend replaces the two emulated primitives of the base RVV 1.0 path (`hash/rvv.h`):
+ *    - the tower-field vector-permute AES round (`sz_emulate_aesenc_rvv_`) is swapped for a single
+ *      `Zvkned` `vaesem.vv` instruction, and
+ *    - the serial SHA-256 block is swapped for the `Zvknhb` `vsha2cl/vsha2ch/vsha2ms` instructions.
+ *  Both produce byte/bit-identical results to the serial reference, so digests are interchangeable.
+ */
+#ifndef STRINGZILLA_HASH_RVVCRYPTO_H_
+#define STRINGZILLA_HASH_RVVCRYPTO_H_
+#include "stringzilla/types.h"
+#include "stringzilla/hash/serial.h"
+#include "stringzilla/compare.h" 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#if SZ_USE_RVVCRYPTO
+#include <riscv_vector.h>
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("arch=+v,+zvkned,+zvknhb"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("arch=+v,+zvkned,+zvknhb")
+#endif
+#pragma region RVV Crypto AES Round (Zvkned)
+/**
+ *  @brief Bit-exact `Zvkned` implementation of a single `_mm_aesenc_si128` round.
+ *  @return Result of `MixColumns(SubBytes(ShiftRows(state))) ^ round_key`, identical to
+ *          `sz_emulate_aesenc_si128_serial_` and to `sz_emulate_aesenc_rvv_`.
+ *
+ *  RISC-V's `vaesem.vv vd, vs2` computes `vd = MixColumns(SubBytes(ShiftRows(vd))) ^ vs2`, which is
+ *  exactly the AES-NI `AESENC` operation: the state in `vd`, the round key in `vs2`. A single 128-bit
+ *  AES block is one element group (`EGW = 128`), so the operation runs with `vector_length = 4` 32-bit lanes.
+ */
+SZ_HELPER_INLINE sz_u128_vec_t sz_emulate_aesenc_rvvcrypto_(sz_u128_vec_t state_vec, sz_u128_vec_t round_key_vec) {
+    sz_size_t vector_length = __riscv_vsetvl_e32m1(4); 
+    vuint32m1_t state_u32m1 = __riscv_vle32_v_u32m1((sz_u32_t const *)state_vec.u32s, vector_length);
+    vuint32m1_t key_u32m1 = __riscv_vle32_v_u32m1((sz_u32_t const *)round_key_vec.u32s, vector_length);
+    state_u32m1 = __riscv_vaesem_vv_u32m1(state_u32m1, key_u32m1, vector_length);
+    sz_u128_vec_t result_vec;
+    __riscv_vse32_v_u32m1(result_vec.u32s, state_u32m1, vector_length);
+    return result_vec;
+}
+#pragma endregion // RVV Crypto AES Round
+#pragma region RVV Crypto Hash Drivers
+SZ_HELPER_AUTO void sz_hash_state_short_update_rvvcrypto_(sz_hash_state_aligned_for_short_t *state,
+                                                          sz_u128_vec_t block_vec) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    state->aes = sz_emulate_aesenc_rvvcrypto_(state->aes, block_vec);
+    state->sum = sz_emulate_shuffle_epi8_serial_(state->sum, shuffle);
+    state->sum.u64s[0] += block_vec.u64s[0], state->sum.u64s[1] += block_vec.u64s[1];
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_short_finalize_rvvcrypto_(sz_hash_state_aligned_for_short_t const *state,
+                                                                sz_size_t length) {
+    sz_u128_vec_t key_with_length_vec = state->key;
+    key_with_length_vec.u64s[0] += length;
+    sz_u128_vec_t mixed_vec = sz_emulate_aesenc_rvvcrypto_(state->sum, state->aes);
+    sz_u128_vec_t mixed_in_register_vec = sz_emulate_aesenc_rvvcrypto_(
+        sz_emulate_aesenc_rvvcrypto_(mixed_vec, key_with_length_vec), mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+SZ_HELPER_AUTO void sz_hash_state_update_rvvcrypto_(sz_hash_state_aligned_t *state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        state->aes.u128s[lane_index] = sz_emulate_aesenc_rvvcrypto_(state->aes.u128s[lane_index],
+                                                                    state->ins.u128s[lane_index]);
+        state->sum.u128s[lane_index] = sz_emulate_shuffle_epi8_serial_(state->sum.u128s[lane_index], shuffle);
+        state->sum.u128s[lane_index].u64s[0] += state->ins.u128s[lane_index].u64s[0];
+        state->sum.u128s[lane_index].u64s[1] += state->ins.u128s[lane_index].u64s[1];
+    }
+}
+SZ_HELPER_AUTO sz_u64_t sz_hash_state_finalize_rvvcrypto_(sz_hash_state_aligned_t state) {
+    sz_u8_t const *shuffle = sz_hash_u8x16x4_shuffle_();
+    sz_u128_vec_t key_with_length_vec;
+    key_with_length_vec.u64s[0] = state.key.u64s[0] + state.ins_length;
+    key_with_length_vec.u64s[1] = state.key.u64s[1];
+    sz_u128_vec_t aes0_vec = sz_emulate_aesenc_rvvcrypto_(state.aes.u128s[0], state.ins.u128s[0]);
+    sz_u128_vec_t aes1_vec = sz_emulate_aesenc_rvvcrypto_(state.aes.u128s[1], state.ins.u128s[1]);
+    sz_u128_vec_t aes2_vec = sz_emulate_aesenc_rvvcrypto_(state.aes.u128s[2], state.ins.u128s[2]);
+    sz_u128_vec_t aes3_vec = sz_emulate_aesenc_rvvcrypto_(state.aes.u128s[3], state.ins.u128s[3]);
+    sz_u128_vec_t sum0_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[0], shuffle);
+    sz_u128_vec_t sum1_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[1], shuffle);
+    sz_u128_vec_t sum2_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[2], shuffle);
+    sz_u128_vec_t sum3_vec = sz_emulate_shuffle_epi8_serial_(state.sum.u128s[3], shuffle);
+    sum0_vec.u64s[0] += state.ins.u128s[0].u64s[0], sum0_vec.u64s[1] += state.ins.u128s[0].u64s[1];
+    sum1_vec.u64s[0] += state.ins.u128s[1].u64s[0], sum1_vec.u64s[1] += state.ins.u128s[1].u64s[1];
+    sum2_vec.u64s[0] += state.ins.u128s[2].u64s[0], sum2_vec.u64s[1] += state.ins.u128s[2].u64s[1];
+    sum3_vec.u64s[0] += state.ins.u128s[3].u64s[0], sum3_vec.u64s[1] += state.ins.u128s[3].u64s[1];
+    sz_u128_vec_t mixed0_vec = sz_emulate_aesenc_rvvcrypto_(sum0_vec, aes0_vec);
+    sz_u128_vec_t mixed1_vec = sz_emulate_aesenc_rvvcrypto_(sum1_vec, aes1_vec);
+    sz_u128_vec_t mixed2_vec = sz_emulate_aesenc_rvvcrypto_(sum2_vec, aes2_vec);
+    sz_u128_vec_t mixed3_vec = sz_emulate_aesenc_rvvcrypto_(sum3_vec, aes3_vec);
+    sz_u128_vec_t mixed01_vec = sz_emulate_aesenc_rvvcrypto_(mixed0_vec, mixed1_vec);
+    sz_u128_vec_t mixed23_vec = sz_emulate_aesenc_rvvcrypto_(mixed2_vec, mixed3_vec);
+    sz_u128_vec_t mixed_vec = sz_emulate_aesenc_rvvcrypto_(mixed01_vec, mixed23_vec);
+    sz_u128_vec_t mixed_in_register_vec = sz_emulate_aesenc_rvvcrypto_(
+        sz_emulate_aesenc_rvvcrypto_(mixed_vec, key_with_length_vec), mixed_vec);
+    return mixed_in_register_vec.u64s[0];
+}
+/** @brief  Vector-copy a single AES block (`sizeof(sz_u128_vec_t)` bytes) from `source` into `target_vec->u8s`,
+ *          replacing a scalar byte loop. `source` must have a full block of readable bytes. */
+SZ_HELPER_INLINE void sz_hash_load_block_rvvcrypto_(sz_u128_vec_t *target_vec, sz_cptr_t source) {
+    sz_size_t vector_length = __riscv_vsetvl_e8m1(sizeof(target_vec->u8s));
+    __riscv_vse8_v_u8m1(target_vec->u8s, __riscv_vle8_v_u8m1((sz_u8_t const *)source, vector_length), vector_length);
+}
+/** @brief  Vector-copy a single AES block (`sizeof(sz_u128_vec_t)` bytes) from `source_vec` to `target`, the store
+ *          counterpart of `sz_hash_load_block_rvvcrypto_`. `target` must have a full block of writable bytes. */
+SZ_HELPER_INLINE void sz_hash_store_block_rvvcrypto_(sz_ptr_t target, sz_u128_vec_t source_vec) {
+    sz_size_t vector_length = __riscv_vsetvl_e8m1(sizeof(source_vec.u8s));
+    __riscv_vse8_v_u8m1((sz_u8_t *)target, __riscv_vle8_v_u8m1(source_vec.u8s, vector_length), vector_length);
+}
+/**
+ *  @brief Loads the packed public state into the aligned internal twin (one `vle8` block per 16-byte lane).
+ */
+SZ_HELPER_AUTO sz_hash_state_aligned_t sz_hash_state_load_rvvcrypto_(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state;
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        sz_hash_load_block_rvvcrypto_(&state.aes.u128s[lane_index], (sz_cptr_t)(packed->aes + offset));
+        sz_hash_load_block_rvvcrypto_(&state.sum.u128s[lane_index], (sz_cptr_t)(packed->sum + offset));
+        sz_hash_load_block_rvvcrypto_(&state.ins.u128s[lane_index], (sz_cptr_t)(packed->ins + offset));
+    }
+    sz_hash_load_block_rvvcrypto_(&state.key, (sz_cptr_t)packed->key);
+    state.ins_length = packed->ins_length;
+    return state;
+}
+/** @brief Stores the aligned internal twin back into the packed public state (one `vse8` block per 16-byte lane). */
+SZ_HELPER_AUTO void sz_hash_state_store_rvvcrypto_(sz_hash_state_t *packed, sz_hash_state_aligned_t const *state) {
+    for (sz_size_t lane_index = 0; lane_index < 4; ++lane_index) {
+        sz_size_t const offset = lane_index * 16;
+        sz_hash_store_block_rvvcrypto_((sz_ptr_t)(packed->aes + offset), state->aes.u128s[lane_index]);
+        sz_hash_store_block_rvvcrypto_((sz_ptr_t)(packed->sum + offset), state->sum.u128s[lane_index]);
+        sz_hash_store_block_rvvcrypto_((sz_ptr_t)(packed->ins + offset), state->ins.u128s[lane_index]);
+    }
+    sz_hash_store_block_rvvcrypto_((sz_ptr_t)packed->key, state->key);
+    packed->ins_length = state->ins_length;
+}
+SZ_API_COMPTIME SZ_NO_STACK_PROTECTOR sz_u64_t sz_hash_rvvcrypto(sz_cptr_t start, sz_size_t length, sz_u64_t seed) {
+    sz_size_t const block = sizeof(sz_u128_vec_t); 
+    if (length <= block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data_vec;
+        data_vec.u64s[0] = data_vec.u64s[1] = 0;
+        sz_size_t vector_length = __riscv_vsetvl_e8m1(length);
+        __riscv_vse8_v_u8m1(data_vec.u8s, __riscv_vle8_v_u8m1((sz_u8_t const *)start, vector_length), vector_length);
+        sz_hash_state_short_update_rvvcrypto_(&state, data_vec);
+        return sz_hash_state_short_finalize_rvvcrypto_(&state, length);
+    }
+    else if (length <= 2 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec;
+        sz_hash_load_block_rvvcrypto_(&data0_vec, start);
+        sz_hash_load_block_rvvcrypto_(&data1_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data1_vec, (int)(2 * block - length));
+        sz_hash_state_short_update_rvvcrypto_(&state, data0_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data1_vec);
+        return sz_hash_state_short_finalize_rvvcrypto_(&state, length);
+    }
+    else if (length <= 3 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec;
+        sz_hash_load_block_rvvcrypto_(&data0_vec, start);
+        sz_hash_load_block_rvvcrypto_(&data1_vec, start + block);
+        sz_hash_load_block_rvvcrypto_(&data2_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data2_vec, (int)(3 * block - length));
+        sz_hash_state_short_update_rvvcrypto_(&state, data0_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data1_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data2_vec);
+        return sz_hash_state_short_finalize_rvvcrypto_(&state, length);
+    }
+    else if (length <= 4 * block) {
+        sz_align_(16) sz_hash_state_aligned_for_short_t state;
+        sz_hash_state_short_init_serial_(&state, seed);
+        sz_u128_vec_t data0_vec, data1_vec, data2_vec, data3_vec;
+        sz_hash_load_block_rvvcrypto_(&data0_vec, start);
+        sz_hash_load_block_rvvcrypto_(&data1_vec, start + block);
+        sz_hash_load_block_rvvcrypto_(&data2_vec, start + 2 * block);
+        sz_hash_load_block_rvvcrypto_(&data3_vec, start + length - block);
+        sz_hash_shift_in_register_serial_(&data3_vec, (int)(4 * block - length));
+        sz_hash_state_short_update_rvvcrypto_(&state, data0_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data1_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data2_vec);
+        sz_hash_state_short_update_rvvcrypto_(&state, data3_vec);
+        return sz_hash_state_short_finalize_rvvcrypto_(&state, length);
+    }
+    else {
+        sz_align_(64) sz_hash_state_aligned_t state;
+        sz_size_t const window = sizeof(state.ins.u8s); 
+        sz_hash_state_init_serial((sz_hash_state_t *)&state, seed);
+        for (; state.ins_length + window < length; state.ins_length += window) {
+            sz_size_t vector_length = __riscv_vsetvl_e8m8(window); 
+            __riscv_vse8_v_u8m8(state.ins.u8s,
+                                __riscv_vle8_v_u8m8((sz_u8_t const *)start + state.ins_length, vector_length),
+                                vector_length);
+            sz_hash_state_update_rvvcrypto_(&state);
+        }
+        sz_size_t zero_vl = __riscv_vsetvl_e8m8(window);
+        __riscv_vse8_v_u8m8(state.ins.u8s, __riscv_vmv_v_x_u8m8(0, zero_vl), zero_vl);
+        sz_size_t tail_vl = __riscv_vsetvl_e8m8(length - state.ins_length); 
+        __riscv_vse8_v_u8m8(state.ins.u8s, __riscv_vle8_v_u8m8((sz_u8_t const *)start + state.ins_length, tail_vl),
+                            tail_vl);
+        state.ins_length = length;
+        return sz_hash_state_finalize_rvvcrypto_(state);
+    }
+}
+SZ_API_COMPTIME void sz_hash_state_init_rvvcrypto(sz_hash_state_t *state, sz_u64_t seed) {
+    sz_hash_state_init_serial(state, seed);
+}
+SZ_API_COMPTIME void sz_hash_state_update_rvvcrypto(sz_hash_state_t *packed, sz_cptr_t text, sz_size_t length) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_rvvcrypto_(packed);
+    sz_size_t buffered = state.ins_length % 64;
+    if (buffered == 0 && state.ins_length) buffered = 64;
+    while (length) {
+        if (buffered == 64) { 
+            sz_hash_state_update_rvvcrypto_(&state);
+            sz_size_t const clear_vl = __riscv_vsetvl_e8m8(sizeof(state.ins.u8s));
+            __riscv_vse8_v_u8m8(state.ins.u8s, __riscv_vmv_v_x_u8m8(0, clear_vl), clear_vl);
+            buffered = 0;
+        }
+        sz_size_t const take = sz_min_of_two(length, (sz_size_t)64 - buffered);
+        sz_size_t const vl = __riscv_vsetvl_e8m8(take); 
+        __riscv_vse8_v_u8m8(state.ins.u8s + buffered, __riscv_vle8_v_u8m8((sz_u8_t const *)text, vl), vl);
+        buffered += take, text += take, length -= take, state.ins_length += take;
+    }
+    sz_hash_state_store_rvvcrypto_(packed, &state);
+}
+SZ_API_COMPTIME sz_u64_t sz_hash_state_digest_rvvcrypto(sz_hash_state_t const *packed) {
+    sz_hash_state_aligned_t state = sz_hash_state_load_rvvcrypto_(packed);
+    sz_size_t length = state.ins_length;
+    if (length > 64) return sz_hash_state_finalize_rvvcrypto_(state);
+    sz_hash_state_aligned_for_short_t minimal_state;
+    minimal_state.key = state.key;
+    minimal_state.aes = state.aes.u128s[0];
+    minimal_state.sum = state.sum.u128s[0];
+    if (length <= 16) {
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[0]);
+        return sz_hash_state_short_finalize_rvvcrypto_(&minimal_state, length);
+    }
+    else if (length <= 32) {
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[1]);
+        return sz_hash_state_short_finalize_rvvcrypto_(&minimal_state, length);
+    }
+    else if (length <= 48) {
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[2]);
+        return sz_hash_state_short_finalize_rvvcrypto_(&minimal_state, length);
+    }
+    else {
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[0]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[1]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[2]);
+        sz_hash_state_short_update_rvvcrypto_(&minimal_state, state.ins.u128s[3]);
+        return sz_hash_state_short_finalize_rvvcrypto_(&minimal_state, length);
+    }
+}
+SZ_API_COMPTIME void sz_fill_random_rvvcrypto(sz_ptr_t text, sz_size_t length, sz_u64_t nonce) {
+    sz_u64_t const *pi_constants = sz_hash_pi_constants_();
+    sz_u128_vec_t input_vec, pi_vec, key_vec, generated_vec;
+    for (sz_size_t lane_index = 0; length; ++lane_index) {
+        input_vec.u64s[0] = input_vec.u64s[1] = nonce + lane_index;
+        pi_vec = ((sz_u128_vec_t const *)pi_constants)[lane_index % 4];
+        key_vec.u64s[0] = nonce ^ pi_vec.u64s[0];
+        key_vec.u64s[1] = nonce ^ pi_vec.u64s[1];
+        generated_vec = sz_emulate_aesenc_rvvcrypto_(input_vec, key_vec);
+        sz_size_t out_vl = __riscv_vsetvl_e8m1(sz_min_of_two(length, sizeof(generated_vec.u8s)));
+        __riscv_vse8_v_u8m1((sz_u8_t *)text, __riscv_vle8_v_u8m1(generated_vec.u8s, out_vl), out_vl);
+        text += out_vl, length -= out_vl;
+    }
+}
+#pragma endregion // RVV Crypto Hash Drivers
+#pragma region RVV Crypto SHA 256 (Zvknhb)
+/**
+ *  @brief Process a single 512-bit (64-byte) block of data using SHA-256 via `Zvknhb`.
+ *  @param hash Pointer to 8x 32-bit hash values {a,b,c,d,e,f,g,h}, modified in place.
+ *  @param block Pointer to a 64-byte message block.
+ *
+ *  The `Zvknh` state is held in two 128-bit element groups, each four 32-bit lanes. Per the RISC-V
+ *  Vector Crypto spec, `vsha2c[hl].vv` reads `vs2 = {a,b,e,f}` and `vd = {c,d,g,h}` (where `{x@y@z@w}`
+ *  packs `w` into lane 0 and `x` into lane 3, little-endian), and writes the next `{a,b,e,f}` back to
+ *  `vd`. Each instruction performs two compression rounds (`cl` consumes the low two W+K words of the
+ *  group, `ch` the high two). `vsha2ms.vv` expands four message-schedule words per call.
+ *
+ *  The intrinsic argument order (matching OpenSSL's `sha256_block_data_order_zvkb_zvknha_or_zvknhb`):
+ *    - `cdgh = vsha2cl(cdgh, abef, k_plus_w)` then `abef = vsha2ch(abef, cdgh, k_plus_w)` per quad-round,
+ *    - `wN = vsha2ms(wN, vmerge(w_older, w_newer, mask_lane0), w_newest)` to roll the schedule forward.
+ *  SHA-256 words are big-endian; we load them with a scalar byte-swap so this path needs only the
+ *  `Zvknhb` extension (no `Zvbb`/`Zvkb` `vrev8`).
+ */
+SZ_HELPER_AUTO void sz_sha256_process_block_rvvcrypto_(sz_u32_t hash[sz_at_least_(8)],
+                                                       sz_u8_t const block[sz_at_least_(SZ_SHA256_BLOCK_LENGTH)]) {
+    sz_u32_t const *round_constants = sz_sha256_round_constants_();
+    sz_size_t const vector_length = __riscv_vsetvl_e32m1(4);
+    sz_align_(16) sz_u32_t const mask_seed[4] = {1, 0, 0, 0};
+    vbool32_t const lane0_mask_b32 = __riscv_vmsne_vx_u32m1_b32(__riscv_vle32_v_u32m1(mask_seed, vector_length), 0,
+                                                                vector_length);
+    sz_align_(16) sz_u32_t const abef_seed[4] = {hash[5], hash[4], hash[1], hash[0]};
+    sz_align_(16) sz_u32_t const cdgh_seed[4] = {hash[7], hash[6], hash[3], hash[2]};
+    vuint32m1_t abef_u32m1 = __riscv_vle32_v_u32m1(abef_seed, vector_length);
+    vuint32m1_t cdgh_u32m1 = __riscv_vle32_v_u32m1(cdgh_seed, vector_length);
+    vuint32m1_t const abef_saved_u32m1 = abef_u32m1;
+    vuint32m1_t const cdgh_saved_u32m1 = cdgh_u32m1;
+    sz_align_(64) sz_u32_t message_words[16];
+    for (sz_size_t word_index = 0; word_index < 16; ++word_index)
+        message_words[word_index] = ((sz_u32_t)block[word_index * 4 + 0] << 24) |
+                                    ((sz_u32_t)block[word_index * 4 + 1] << 16) |
+                                    ((sz_u32_t)block[word_index * 4 + 2] << 8) |
+                                    ((sz_u32_t)block[word_index * 4 + 3] << 0);
+    vuint32m1_t w0_u32m1 = __riscv_vle32_v_u32m1(&message_words[0], vector_length);
+    vuint32m1_t w1_u32m1 = __riscv_vle32_v_u32m1(&message_words[4], vector_length);
+    vuint32m1_t w2_u32m1 = __riscv_vle32_v_u32m1(&message_words[8], vector_length);
+    vuint32m1_t w3_u32m1 = __riscv_vle32_v_u32m1(&message_words[12], vector_length);
+#define SZ_RVVCRYPTO_SHA_QUAD_(current, newer, older, newest, k_offset)                                             \
+    do {                                                                                                            \
+        vuint32m1_t const round_key_u32m1 = __riscv_vadd_vv_u32m1(                                                  \
+            __riscv_vle32_v_u32m1(&round_constants[(k_offset)], vector_length), (current), vector_length);          \
+        cdgh_u32m1 = __riscv_vsha2cl_vv_u32m1(cdgh_u32m1, abef_u32m1, round_key_u32m1, vector_length);              \
+        abef_u32m1 = __riscv_vsha2ch_vv_u32m1(abef_u32m1, cdgh_u32m1, round_key_u32m1, vector_length);              \
+        vuint32m1_t const merged_u32m1 = __riscv_vmerge_vvm_u32m1((older), (newer), lane0_mask_b32, vector_length); \
+        (current) = __riscv_vsha2ms_vv_u32m1((current), merged_u32m1, (newest), vector_length);                     \
+    } while (0)
+    SZ_RVVCRYPTO_SHA_QUAD_(w0_u32m1, w1_u32m1, w2_u32m1, w3_u32m1, 0);
+    SZ_RVVCRYPTO_SHA_QUAD_(w1_u32m1, w2_u32m1, w3_u32m1, w0_u32m1, 4);
+    SZ_RVVCRYPTO_SHA_QUAD_(w2_u32m1, w3_u32m1, w0_u32m1, w1_u32m1, 8);
+    SZ_RVVCRYPTO_SHA_QUAD_(w3_u32m1, w0_u32m1, w1_u32m1, w2_u32m1, 12);
+    SZ_RVVCRYPTO_SHA_QUAD_(w0_u32m1, w1_u32m1, w2_u32m1, w3_u32m1, 16);
+    SZ_RVVCRYPTO_SHA_QUAD_(w1_u32m1, w2_u32m1, w3_u32m1, w0_u32m1, 20);
+    SZ_RVVCRYPTO_SHA_QUAD_(w2_u32m1, w3_u32m1, w0_u32m1, w1_u32m1, 24);
+    SZ_RVVCRYPTO_SHA_QUAD_(w3_u32m1, w0_u32m1, w1_u32m1, w2_u32m1, 28);
+    SZ_RVVCRYPTO_SHA_QUAD_(w0_u32m1, w1_u32m1, w2_u32m1, w3_u32m1, 32);
+    SZ_RVVCRYPTO_SHA_QUAD_(w1_u32m1, w2_u32m1, w3_u32m1, w0_u32m1, 36);
+    SZ_RVVCRYPTO_SHA_QUAD_(w2_u32m1, w3_u32m1, w0_u32m1, w1_u32m1, 40);
+    SZ_RVVCRYPTO_SHA_QUAD_(w3_u32m1, w0_u32m1, w1_u32m1, w2_u32m1, 44);
+#undef SZ_RVVCRYPTO_SHA_QUAD_
+#define SZ_RVVCRYPTO_SHA_TAIL_(current, k_offset)                                                          \
+    do {                                                                                                   \
+        vuint32m1_t const round_key_u32m1 = __riscv_vadd_vv_u32m1(                                         \
+            __riscv_vle32_v_u32m1(&round_constants[(k_offset)], vector_length), (current), vector_length); \
+        cdgh_u32m1 = __riscv_vsha2cl_vv_u32m1(cdgh_u32m1, abef_u32m1, round_key_u32m1, vector_length);     \
+        abef_u32m1 = __riscv_vsha2ch_vv_u32m1(abef_u32m1, cdgh_u32m1, round_key_u32m1, vector_length);     \
+    } while (0)
+    SZ_RVVCRYPTO_SHA_TAIL_(w0_u32m1, 48);
+    SZ_RVVCRYPTO_SHA_TAIL_(w1_u32m1, 52);
+    SZ_RVVCRYPTO_SHA_TAIL_(w2_u32m1, 56);
+    SZ_RVVCRYPTO_SHA_TAIL_(w3_u32m1, 60);
+#undef SZ_RVVCRYPTO_SHA_TAIL_
+    abef_u32m1 = __riscv_vadd_vv_u32m1(abef_saved_u32m1, abef_u32m1, vector_length);
+    cdgh_u32m1 = __riscv_vadd_vv_u32m1(cdgh_saved_u32m1, cdgh_u32m1, vector_length);
+    sz_align_(16) sz_u32_t abef_out[4];
+    sz_align_(16) sz_u32_t cdgh_out[4];
+    __riscv_vse32_v_u32m1(abef_out, abef_u32m1, vector_length);
+    __riscv_vse32_v_u32m1(cdgh_out, cdgh_u32m1, vector_length);
+    hash[5] = abef_out[0], hash[4] = abef_out[1], hash[1] = abef_out[2], hash[0] = abef_out[3];
+    hash[7] = cdgh_out[0], hash[6] = cdgh_out[1], hash[3] = cdgh_out[2], hash[2] = cdgh_out[3];
+}
+SZ_API_COMPTIME void sz_sha256_state_init_rvvcrypto(sz_sha256_state_t *state_ptr) {
+    sz_u32_t const *initial_hash = sz_sha256_initial_hash_();
+    sz_size_t const vector_length = __riscv_vsetvl_e32m1(4);
+    __riscv_vse32_v_u32m1(state_ptr->hash + 0, __riscv_vle32_v_u32m1(initial_hash + 0, vector_length), vector_length);
+    __riscv_vse32_v_u32m1(state_ptr->hash + 4, __riscv_vle32_v_u32m1(initial_hash + 4, vector_length), vector_length);
+    state_ptr->block_length = 0, state_ptr->total_length = 0;
+}
+SZ_API_COMPTIME void sz_sha256_state_update_rvvcrypto(sz_sha256_state_t *state_ptr, sz_cptr_t data, sz_size_t length) {
+    sz_u8_t const *input = (sz_u8_t const *)data;
+    sz_size_t const current_block_index = state_ptr->block_length / SZ_SHA256_BLOCK_LENGTH;
+    sz_size_t const final_block_index = (state_ptr->block_length + length) / SZ_SHA256_BLOCK_LENGTH;
+    int const stays_in_the_block = current_block_index == final_block_index;
+    int const fills_the_block = (state_ptr->block_length + length) % SZ_SHA256_BLOCK_LENGTH == 0;
+    state_ptr->total_length += length;
+    if (stays_in_the_block && !fills_the_block) {
+        for (; length; --length, ++state_ptr->block_length, ++input) state_ptr->block[state_ptr->block_length] = *input;
+        return;
+    }
+    sz_size_t const head_length = (SZ_SHA256_BLOCK_LENGTH - state_ptr->block_length) % SZ_SHA256_BLOCK_LENGTH;
+    sz_size_t const tail_length = (state_ptr->block_length + length) % SZ_SHA256_BLOCK_LENGTH;
+    sz_size_t const body_length = length - head_length - tail_length;
+    sz_align_(32) sz_u32_t hash[8];
+    hash[0] = state_ptr->hash[0], hash[1] = state_ptr->hash[1], hash[2] = state_ptr->hash[2],
+    hash[3] = state_ptr->hash[3], hash[4] = state_ptr->hash[4], hash[5] = state_ptr->hash[5],
+    hash[6] = state_ptr->hash[6], hash[7] = state_ptr->hash[7];
+    if (head_length) {
+        for (sz_size_t byte_index = 0; byte_index < head_length; ++byte_index)
+            state_ptr->block[state_ptr->block_length++] = input[byte_index];
+        sz_sha256_process_block_rvvcrypto_(hash, state_ptr->block);
+        state_ptr->block_length = 0;
+        input += head_length;
+    }
+    for (sz_size_t processed = 0; processed < body_length;
+         processed += SZ_SHA256_BLOCK_LENGTH, input += SZ_SHA256_BLOCK_LENGTH)
+        sz_sha256_process_block_rvvcrypto_(hash, input);
+    for (sz_size_t byte_index = 0; byte_index < tail_length; ++byte_index)
+        state_ptr->block[byte_index] = input[byte_index];
+    state_ptr->block_length = tail_length;
+    state_ptr->hash[0] = hash[0], state_ptr->hash[1] = hash[1], state_ptr->hash[2] = hash[2],
+    state_ptr->hash[3] = hash[3];
+    state_ptr->hash[4] = hash[4], state_ptr->hash[5] = hash[5], state_ptr->hash[6] = hash[6],
+    state_ptr->hash[7] = hash[7];
+}
+SZ_API_COMPTIME void sz_sha256_state_digest_rvvcrypto(sz_sha256_state_t const *state_ptr,
+                                                      sz_u8_t digest[sz_at_least_(SZ_SHA256_DIGEST_LENGTH)]) {
+    sz_sha256_state_t state = *state_ptr;
+    state.block[state.block_length++] = 0x80;
+    if (state.block_length > 56) {
+        sz_size_t remaining = SZ_SHA256_BLOCK_LENGTH - state.block_length;
+        for (sz_size_t byte_index = 0; byte_index < remaining; ++byte_index)
+            state.block[state.block_length + byte_index] = 0;
+        sz_sha256_process_block_rvvcrypto_(state.hash, state.block);
+        state.block_length = 0;
+    }
+    sz_size_t remaining = 56 - state.block_length;
+    for (sz_size_t byte_index = 0; byte_index < remaining; ++byte_index)
+        state.block[state.block_length + byte_index] = 0;
+    state.block_length = 56;
+    sz_u64_t bit_length = state.total_length * 8;
+    state.block[56] = (sz_u8_t)(bit_length >> 56);
+    state.block[57] = (sz_u8_t)(bit_length >> 48);
+    state.block[58] = (sz_u8_t)(bit_length >> 40);
+    state.block[59] = (sz_u8_t)(bit_length >> 32);
+    state.block[60] = (sz_u8_t)(bit_length >> 24);
+    state.block[61] = (sz_u8_t)(bit_length >> 16);
+    state.block[62] = (sz_u8_t)(bit_length >> 8);
+    state.block[63] = (sz_u8_t)(bit_length >> 0);
+    sz_sha256_process_block_rvvcrypto_(state.hash, state.block);
+    for (sz_size_t lane_index = 0; lane_index < 8; ++lane_index) {
+        digest[lane_index * 4 + 0] = (sz_u8_t)(state.hash[lane_index] >> 24);
+        digest[lane_index * 4 + 1] = (sz_u8_t)(state.hash[lane_index] >> 16);
+        digest[lane_index * 4 + 2] = (sz_u8_t)(state.hash[lane_index] >> 8);
+        digest[lane_index * 4 + 3] = (sz_u8_t)(state.hash[lane_index] >> 0);
+    }
+}
+#pragma endregion // RVV Crypto SHA 256
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+#endif 
+#ifdef __cplusplus
+}
+#endif
+#endif 

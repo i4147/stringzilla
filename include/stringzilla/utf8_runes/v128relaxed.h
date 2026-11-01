@@ -1,0 +1,31 @@
+/**
+ *  @brief WebAssembly relaxed-SIMD backend for UTF-8 codepoint mechanics (level above SIMD128).
+ *  @file include/stringzilla/utf8_runes/v128relaxed.h
+ *  @author Ash Vardanian
+ */
+#ifndef STRINGZILLA_UTF8_RUNES_V128RELAXED_H_
+#define STRINGZILLA_UTF8_RUNES_V128RELAXED_H_
+#include "stringzilla/types.h"
+#include "stringzilla/utf8_runes/serial.h"
+#include "stringzilla/utf8_runes/v128.h" 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#if SZ_USE_V128RELAXED
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("relaxed-simd"))), apply_to = function)
+#endif
+SZ_API_COMPTIME sz_size_t sz_utf8_count_v128relaxed(sz_cptr_t text, sz_size_t length) {
+    return sz_utf8_count_v128(text, length);
+}
+SZ_API_COMPTIME sz_cptr_t sz_utf8_seek_v128relaxed(sz_cptr_t text, sz_size_t length, sz_size_t n) {
+    return sz_utf8_seek_v128(text, length, n);
+}
+#if defined(__clang__)
+#pragma clang attribute pop
+#endif
+#endif 
+#ifdef __cplusplus
+}
+#endif
+#endif 
